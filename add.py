@@ -9,7 +9,7 @@ import plotly.graph_objects as go
 # 1. 페이지 설정 및 SELLERNOTE 딥그린 테마 스타일
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="셀러노트 | 발주 프로그램",
+    page_title="셀러노트 버전2(이건나중에뺴쟈) | 발주 프로그램",
     layout="wide",
     initial_sidebar_state="expanded"
 )
