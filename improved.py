@@ -81,6 +81,15 @@ st.markdown("""
         border-radius: 12px;
         box-shadow: 0 1px 2px rgba(0,0,0,0.03);
     }
+    .order-recommend {
+        background: #E6F2ED;
+        border: 2px solid #096351;
+        border-radius: 12px;
+        padding: 0.85rem 1.1rem;
+        min-height: 112px;
+    }
+    .order-recommend-label { color: #153D34; font-size: 0.95rem; font-weight: 700; }
+    .order-recommend-value { color: #096351; font-size: 2.1rem; font-weight: 800; line-height: 1.4; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -463,14 +472,32 @@ tab1, tab4 = st.tabs([
 with tab1:
     st.subheader(f"발주 권고 · {active_sku['id']}")
     order_day = BASE_DATE if active_res["recommend"] > 0 else None
+    on_hand = sum(int(l["qty"]) for l in active_sku["lots"])
+    in_transit = sum(int(l["qty"]) for l in active_sku["inbound"])
     order_c1, order_c2, order_c3 = st.columns(3)
-    order_c1.metric("권고 발주량", f"{active_res['recommend']:,}개")
-    order_c2.metric("담당자 입력 발주량", f"{active_sku['planned']:,}개")
+    order_c1.metric("현재 재고량 (보유 + 운송 중)", f"{on_hand + in_transit:,}개", help=f"보유 {on_hand:,}개 + 운송 중으로 가정한 예정 입고 {in_transit:,}개")
+    order_c2.markdown(f'<div class="order-recommend"><div class="order-recommend-label">권고 발주량 · 신규 해상</div><div class="order-recommend-value">{active_res["recommend"]:,}개</div></div>', unsafe_allow_html=True)
     order_c3.metric("권고 발주시점", order_day.strftime("%Y.%m.%d (오늘)") if order_day else "현재 발주 불필요")
-    st.caption("선택한 SKU 기준 · 재고·입고·확정 주문을 반영해 권고량을 다시 계산합니다. 담당자 희망 발주량은 권고량 계산에 쓰지 않고 비교용으로 표시합니다. 발주시점은 재주문점 충족 시 기준일입니다.")
+    st.caption(f"선택한 SKU 기준 · 보유 {on_hand:,}개 + 예정 입고 {in_transit:,}개. 권고량은 신규 해상 발주량이며 항공 긴급 투입량과 별개입니다. 발주시점은 재주문점 충족 시 기준일입니다.")
     if (st.session_state.get("recalculation_note") or {}).get("sku") == active_sku["id"]:
         st.info(st.session_state.recalculation_note["message"])
     st.warning("로트별 재고·소비기한과 예정 입고 데이터는 제공된 원장으로 확인되지 않았습니다. 현재 값은 시연용 가정이며, 실제 발주 전 담당자의 확인이 필요합니다.")
+
+    st.subheader("금주 발주 물량 요약")
+    sea_orders = [r for r in results if r["recommend"] > 0]
+    air_orders = [r for r in results if r["airQty"] > 0]
+    two_week_risks = [r for r in results if r["p95"]["firstGap"] is not None and r["p95"]["firstGap"] < 14]
+    waste_risks = [r for r in results if r["waste"] > 0]
+    summary_a, summary_b, summary_c, summary_d = st.columns(4)
+    summary_a.metric("해상 발주 대상", f"{len(sea_orders)} SKU")
+    summary_b.metric("해상 권고 총수량", f"{sum(r['recommend'] for r in sea_orders):,}개")
+    summary_c.metric("항공 투입 검토", f"{len(air_orders)} SKU", help="긴급 항공 투입량이 0개보다 큰 SKU 수")
+    summary_d.metric("2주 안 품절 위험", f"{len(two_week_risks)} SKU", help="P95 시나리오의 최초 부족일이 기준일로부터 14일 미만인 SKU 수")
+    summary_e, summary_f, summary_g = st.columns(3)
+    summary_e.metric("폐기 위험", f"{len(waste_risks)} SKU", help="현재 로트의 P20 시나리오 예상 폐기량이 0개보다 큰 SKU 수")
+    summary_f.metric("해상 공급처 수", "데이터 없음", help="현재 입력 파일에 공급처 식별 정보가 없습니다.")
+    summary_g.metric("데이터 기준일", BASE_DATE.strftime("%Y.%m.%d"))
+    st.caption("전체 SKU의 시연용 재고·입고 가정을 이용한 요약입니다. 해상·항공 물량은 별도로 계산하며, 공급처 수는 원본 정보가 없어 집계하지 않습니다.")
     if st.session_state.get("show_alert_orders"):
         alert_sku_ids = {a[2] for a in visible_alerts}
         st.subheader("긴급·변동 SKU 발주 권고 결과")
@@ -489,8 +516,8 @@ with tab1:
     # 직관적인 발주 조건 및 변동 시뮬레이션 입력창
     col_in_head, col_reset = st.columns([4, 1])
     with col_in_head:
-        st.subheader(f"발주 조건 및 변동 시뮬레이션 입력 — [{active_sku['id']} {active_sku['name']}]")
-        st.caption("수량과 입고 예정일을 수정할 수 있습니다. D+일은 기준일(2026.11.16) 이후의 일수입니다.")
+        st.subheader("발주 시나리오 검토")
+        st.caption(f"{active_sku['id']} · {active_sku['name']}  |  재고와 입고 조건을 수정해 권고 결과를 비교하세요. D+일은 기준일(2026.11.16) 이후의 일수입니다.")
     with col_reset:
         if st.button("초기 예시값 복원", use_container_width=True):
             st.session_state.sku_data = get_initial_data()
