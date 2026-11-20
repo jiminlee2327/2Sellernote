@@ -24,7 +24,10 @@ ARCHIVE = Path(__file__).resolve().parent / "발주규칙_가공데이터.zip"
 st.markdown("""<style>
 .recommend {background:#e5f3ed;border:2px solid #08715b;border-radius:12px;padding:17px 22px}
 .recommend b {color:#075943;font-size:2rem}
-.selected {background:#f0f6f3;border-left:4px solid #08715b;padding:11px 15px;border-radius:5px;margin:0 0 16px}
+div[data-testid="stMetric"] {background:#fff;border:1px solid #d9e5df;border-radius:12px;padding:17px 22px;min-height:111px;box-shadow:0 1px 2px rgba(0,0,0,.03)}
+.alert-card {padding:.75rem .95rem;border-radius:8px;margin-bottom:.55rem;font-size:.88rem;line-height:1.45}
+.alert-red {background:#fce5e4;border-left:5px solid #d93025;color:#7f1d1d}
+.alert-orange {background:#ffead8;border-left:5px solid #f59e0b;color:#78350f}
 </style>""", unsafe_allow_html=True)
 
 
@@ -111,18 +114,42 @@ if not matches:
 sid = query if query in plan.index else matches[0]
 row = plan.loc[sid]
 name = str(row["상품명"]) if pd.notna(row["상품명"]) else "상품명 미제공"
-st.markdown(f'<div class="selected"><strong>선택한 상품</strong> · {escape(name)} <small>({escape(sid)})</small></div>', unsafe_allow_html=True)
+st.text_input("선택한 상품", value=f"{name} ({sid})", disabled=True)
 if len(matches) > 1 and query != sid:
     st.caption(f"검색 결과 {len(matches)}건 중 {sid}를 표시합니다. 전체 ID를 입력하면 해당 상품을 볼 수 있습니다.")
 
 state = scenario(sid)
 left, middle, right = st.columns(3)
-left.metric("재고 포지션 (창고 + 운송 중)", f"{state['position']:,}개")
+left.metric("현재 재고량 (창고 + 운송 중)", f"{state['position']:,}개")
 middle.markdown(f'<div class="recommend">권고 해상 발주량<br><b>{state["quantity"]:,}개</b></div>' if state["quantity"] is not None else '<div class="recommend">권고 해상 발주량<br><b>계산 불가</b></div>', unsafe_allow_html=True)
-right.metric("발주 판단 기준일", f"{DATA_DATE:%Y.%m.%d}" if state["quantity"] else "발주 대상 아님")
+right.metric("권고 발주시점", f"{DATA_DATE:%Y.%m.%d} (기준일)" if state["quantity"] else "현재 발주 불필요")
 st.caption(f"창고 {state['stock']:,}개 + 운송 중 {state['transit']:,}개 · 발주팀 원안 {state['original']:,}개 · 항공 주문량 {number(row['항공 주문량']):,}개")
 if state["changed"]:
     st.warning("변경 후 권고량은 발주팀의 주문선 s·목표량 S·박스 입수를 고정한 재고 포지션 검토값입니다. 공급처 묶음 발주와 원 규칙 전체를 다시 계산한 공식 발주안은 아닙니다.")
+
+risky = plan[(plan["창고 재고일수"] < 14) & (plan["하루 판매량 d"] > 0)]
+alerted = plan[(plan["항공 주문량"] > 0) | (plan["창고 재고일수"] < 14)].copy()
+alerted = alerted.sort_values(["항공 주문량", "창고 재고일수"], ascending=[False, True])
+with st.sidebar:
+    st.header("담당자 알림 시스템")
+    st.caption(f"{DATA_DATE:%Y.%m.%d} 발주팀 발주안 기준 · 확인 대상 {len(alerted)} SKU")
+    st.caption("항공 주문량이 있는 SKU와 창고 재고일수 14일 미만 SKU를 표시합니다.")
+    if st.button("알림 SKU 권고 목록 보기", width="stretch"):
+        st.session_state.show_alert_orders = not st.session_state.get("show_alert_orders", False)
+    with st.container(height=380, border=True):
+        if alerted.empty:
+            st.info("확인할 알림이 없습니다.")
+        for _, item in alerted.iterrows():
+            urgent = number(item["항공 주문량"]) > 0
+            label = "🔴 항공 주문 검토" if urgent else "🟠 창고 재고 확인"
+            detail = (f"항공 주문량 {number(item['항공 주문량']):,}개" if urgent
+                      else f"창고 재고일수 {float(item['창고 재고일수']):.1f}일")
+            st.markdown(
+                f'<div class="alert-card {"alert-red" if urgent else "alert-orange"}">'
+                f'<strong>{label}</strong><br>{escape(str(item["SKU ID"]))} · {escape(str(item["상품명"]))}<br>'
+                f'{detail} · 해상 권고 {number(item["해상 주문량"]):,}개</div>',
+                unsafe_allow_html=True,
+            )
 
 tab_overview, tab_status, tab_week = st.tabs(["종합 대시보드", "SKU별 발주 상태", "금주 발주 요약"])
 
@@ -147,18 +174,9 @@ with tab_overview:
         st.session_state.pop(f"transit_{sid}", None)
         st.rerun()
 
-    st.subheader("담당자 알림 시스템")
-    risky = plan[(plan["창고 재고일수"] < 14) & (plan["하루 판매량 d"] > 0)]
-    st.caption("창고 재고일수 14일 미만은 확인 대상입니다. 입고 전 실제 품절 여부는 운송 건별 일정과 수요 변동을 확인해야 합니다.")
-    if st.button("확인 필요한 SKU 목록 보기"):
-        st.session_state.show_alert_orders = not st.session_state.get("show_alert_orders", False)
-    with st.container(height=220, border=True):
-        if risky.empty:
-            st.write("확인 대상이 없습니다.")
-        for _, item in risky.sort_values("창고 재고일수").iterrows():
-            st.write(f"🔴 {item['SKU ID']} · {item['상품명']} · 창고 재고일수 {item['창고 재고일수']:.1f}일 · 해상 권고 {number(item['해상 주문량']):,}개")
     if st.session_state.get("show_alert_orders"):
-        st.dataframe(risky[["SKU ID", "상품명", "공급처", "창고 재고", "운송 중 재고", "창고 재고일수", "해상 주문량", "항공 주문량", "판단"]], hide_index=True, width="stretch")
+        st.subheader("알림 SKU 발주 권고 결과")
+        st.dataframe(alerted[["SKU ID", "상품명", "공급처", "창고 재고", "운송 중 재고", "창고 재고일수", "해상 주문량", "항공 주문량", "판단"]], hide_index=True, width="stretch")
 
     with st.expander("전체 SKU 발주 권고 결과표"):
         st.dataframe(plan[["SKU ID", "상품명", "공급처", "창고 재고", "운송 중 재고", "재고 포지션 IP", "판단", "해상 주문량", "항공 주문량"]], hide_index=True, width="stretch")
