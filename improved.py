@@ -461,9 +461,10 @@ with st.sidebar:
 # ---------------------------------------------------------
 # 6. 메인 탭 구성
 # ---------------------------------------------------------
-tab1, tab4 = st.tabs([
+tab1, tab4, tab_summary = st.tabs([
     "종합 대시보드",
-    "SKU별 발주 상태"
+    "SKU별 발주 상태",
+    "금주 발주 요약"
 ])
 
 # =========================================================
@@ -483,21 +484,6 @@ with tab1:
         st.info(st.session_state.recalculation_note["message"])
     st.warning("로트별 재고·소비기한과 예정 입고 데이터는 제공된 원장으로 확인되지 않았습니다. 현재 값은 시연용 가정이며, 실제 발주 전 담당자의 확인이 필요합니다.")
 
-    st.subheader("금주 발주 물량 요약")
-    sea_orders = [r for r in results if r["recommend"] > 0]
-    air_orders = [r for r in results if r["airQty"] > 0]
-    two_week_risks = [r for r in results if r["p95"]["firstGap"] is not None and r["p95"]["firstGap"] < 14]
-    waste_risks = [r for r in results if r["waste"] > 0]
-    summary_a, summary_b, summary_c, summary_d = st.columns(4)
-    summary_a.metric("해상 발주 대상", f"{len(sea_orders)} SKU")
-    summary_b.metric("해상 권고 총수량", f"{sum(r['recommend'] for r in sea_orders):,}개")
-    summary_c.metric("항공 투입 검토", f"{len(air_orders)} SKU", help="긴급 항공 투입량이 0개보다 큰 SKU 수")
-    summary_d.metric("2주 안 품절 위험", f"{len(two_week_risks)} SKU", help="P95 시나리오의 최초 부족일이 기준일로부터 14일 미만인 SKU 수")
-    summary_e, summary_f, summary_g = st.columns(3)
-    summary_e.metric("폐기 위험", f"{len(waste_risks)} SKU", help="현재 로트의 P20 시나리오 예상 폐기량이 0개보다 큰 SKU 수")
-    summary_f.metric("해상 공급처 수", "데이터 없음", help="현재 입력 파일에 공급처 식별 정보가 없습니다.")
-    summary_g.metric("데이터 기준일", BASE_DATE.strftime("%Y.%m.%d"))
-    st.caption("전체 SKU의 시연용 재고·입고 가정을 이용한 요약입니다. 해상·항공 물량은 별도로 계산하며, 공급처 수는 원본 정보가 없어 집계하지 않습니다.")
     if st.session_state.get("show_alert_orders"):
         alert_sku_ids = {a[2] for a in visible_alerts}
         st.subheader("긴급·변동 SKU 발주 권고 결과")
@@ -670,3 +656,22 @@ with tab4:
             "의뢰→도착 리드타임": f"{o['eta'] - o['request']}일"
         })
     st.dataframe(pd.DataFrame(rec_rows), use_container_width=True, hide_index=True)
+
+
+# 전체 SKU 금주 발주 요약
+with tab_summary:
+    st.subheader("금주 발주 물량 요약")
+    sea_orders = [r for r in results if r["recommend"] > 0]
+    air_orders = [r for r in results if r["airQty"] > 0]
+    two_week_risks = [r for r in results if r["p95"]["firstGap"] is not None and r["p95"]["firstGap"] < 14]
+    waste_risks = [r for r in results if r["waste"] > 0]
+    summary_a, summary_b, summary_c, summary_d = st.columns(4)
+    summary_a.metric("해상 발주 대상", f"{len(sea_orders)} SKU")
+    summary_b.metric("해상 권고 총수량", f"{sum(r['recommend'] for r in sea_orders):,}개")
+    summary_c.metric("항공 투입 검토", f"{len(air_orders)} SKU", help="긴급 항공 투입량이 0개보다 큰 SKU 수")
+    summary_d.metric("2주 안 품절 위험", f"{len(two_week_risks)} SKU", help="P95 시나리오의 최초 부족일이 기준일로부터 14일 미만인 SKU 수")
+    summary_e, summary_f, summary_g = st.columns(3)
+    summary_e.metric("폐기 위험", f"{len(waste_risks)} SKU", help="현재 로트의 P20 시나리오 예상 폐기량이 0개보다 큰 SKU 수")
+    summary_f.metric("해상 공급처 수", "데이터 없음", help="현재 입력 파일에 공급처 식별 정보가 없습니다.")
+    summary_g.metric("데이터 기준일", BASE_DATE.strftime("%Y.%m.%d"))
+    st.caption("전체 SKU의 시연용 재고·입고 가정을 이용한 요약입니다. 해상·항공 물량은 별도로 계산하며, 공급처 수는 원본 정보가 없어 집계하지 않습니다.")
