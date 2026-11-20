@@ -127,6 +127,40 @@ def scenario(sid: str) -> dict:
             "extra_b2b": extra_b2b, "delayed_qty": delayed_qty}
 
 
+def b2b_date_risk(sid: str, stock: int, underway: int, qty: int, when: date, delay: int):
+    """원장 ETA와 발주안 일평균 출고를 사용한 기준일 이후의 날짜별 재고 흐름."""
+    if qty <= 0:
+        return None
+    detail = transit[transit["SKU ID"] == sid].sort_values("기준일부터 입항 예정까지(일)")
+    if number(detail["운송 중 수량(개)"].sum()) != underway:
+        return {"error": "수정된 운송 중 총량을 입고 건별 도착일에 배분할 수 없습니다. 입고 건별 수량과 날짜를 확인해야 출고일 부족량을 계산할 수 있습니다."}
+    if detail["기준일부터 입항 예정까지(일)"].isna().any():
+        return {"error": "입고 예정일이 비어 있는 운송 건이 있어 날짜별 재고를 계산할 수 없습니다."}
+    elapsed = (when - DATA_DATE).days
+    if elapsed < 0:
+        return {"error": "추가 B2B 출고일이 데이터 기준일 이전입니다."}
+    arrivals = {}
+    for index, (_, item) in enumerate(detail.iterrows()):
+        eta = int(item["기준일부터 입항 예정까지(일)"]) + (delay if index == 0 else 0)
+        arrivals[eta] = arrivals.get(eta, 0) + number(item["운송 중 수량(개)"])
+    remaining = float(stock)
+    first_gap = None
+    sales_per_day = float(plan.loc[sid]["하루 판매량 d"])
+    for day in range(elapsed + 1):
+        remaining += arrivals.get(day, 0)
+        daily_shortage = max(0.0, sales_per_day - remaining)
+        if daily_shortage > 0 and first_gap is None:
+            first_gap = DATA_DATE + timedelta(days=day)
+        remaining = max(0.0, remaining - sales_per_day)
+        if day == elapsed:
+            before_b2b = remaining
+            b2b_shortage = max(0.0, qty - before_b2b)
+            if b2b_shortage > 0 and first_gap is None:
+                first_gap = when
+    return {"stock_before_b2b": before_b2b, "b2b_shortage": b2b_shortage,
+            "first_gap": first_gap, "daily_demand": sales_per_day}
+
+
 st.title("발주 검토 대시보드")
 st.caption(f"발주팀 가공 데이터 기준일 {DATA_DATE:%Y.%m.%d} · 발주안 {len(plan)}개 SKU · 현재 실시간 수치가 아닙니다")
 st.info("운송 중 재고는 발주팀이 수작업으로 추정한 값입니다. 일부 박스 입수와 소비기한 역산에도 가정이 포함돼 있어 실제 발주 전 확인이 필요합니다.")
@@ -228,7 +262,7 @@ with tab_overview:
         st.markdown("#### 2단계 · 신규 발주 희망량 및 돌발 변수 입력")
         s1, s2, s3, s4 = st.columns(4)
         planned = s1.number_input("금주 신규 발주 희망 수량 (개)", min_value=0, value=int(st.session_state.get(f"planned_{sid}", state["original"])))
-        extra_b2b = s2.number_input("추가 확정 B2B 주문량 (개)", min_value=0, value=int(state["extra_b2b"]), help="기준일 수요예측에 포함되지 않은 추가 주문만 입력하세요.")
+        extra_b2b = s2.number_input("추가 확정 B2B 주문량 (개)", min_value=0, value=int(st.session_state.get(f"b2b_raw_{sid}", 0)), help="기준일 수요예측에 포함되지 않은 추가 주문만 입력하세요.")
         b2b_date = s3.date_input("추가 B2B 출고 예정일", value=st.session_state.get(f"b2b_date_{sid}", DATA_DATE))
         delay = s4.number_input("가장 빠른 예정 입고 지연 (+일)", min_value=0, value=int(st.session_state.get(f"delay_{sid}", 0)), disabled=details.empty)
         submitted = st.form_submit_button("입력값 반영 및 발주 권고 재계산", type="primary", width="stretch")
@@ -242,6 +276,7 @@ with tab_overview:
             st.session_state[f"stock_{sid}"] = sum(x["수량"] for x in lot_inputs) if selected_keys else int(stock_input)
             st.session_state[f"transit_{sid}"] = int(transit_input)
             st.session_state[f"planned_{sid}"] = int(planned)
+            st.session_state[f"b2b_raw_{sid}"] = int(extra_b2b)
             lead = number(row["리드타임 L(일)"]) + 14
             st.session_state[f"b2b_{sid}"] = int(extra_b2b) if (b2b_date - DATA_DATE).days < lead else 0
             st.session_state[f"b2b_date_{sid}"] = b2b_date
@@ -264,10 +299,29 @@ with tab_overview:
         st.caption(f"확인된 로트 {len(saved_lots)}건 · 수량 합계 {state['stock']:,}개를 반영했습니다. 로트별 판매 마감일은 발주량의 폐기 상한 계산에 아직 연결되지 않았습니다.")
     if state["extra_b2b"] or state["delayed_qty"]:
         st.info(f"추가 B2B 수요 {state['extra_b2b']:,}개 · 보호기간 밖으로 밀린 운송 중 수량 {state['delayed_qty']:,}개를 발주 판단 재고에서 차감했습니다. 출고일별 수요 분포와 입고별 소비기한은 이 간이 계산에 반영되지 않습니다.")
+    if f"planned_{sid}" in st.session_state and st.session_state.get(f"b2b_raw_{sid}", 0) > 0:
+        risk = b2b_date_risk(
+            sid, state["stock"], state["transit"], st.session_state[f"b2b_raw_{sid}"],
+            st.session_state[f"b2b_date_{sid}"], st.session_state.get(f"delay_{sid}", 0),
+        )
+        if "error" in risk:
+            st.warning(risk["error"])
+        else:
+            st.markdown("#### 추가 B2B 출고일 재고 확인")
+            v1, v2 = st.columns(2)
+            v1.metric("추가 주문 반영 전 출고일 예상 잔량", f"{risk['stock_before_b2b']:,.1f}개")
+            v2.metric("추가 B2B 주문의 예상 부족량", f"{risk['b2b_shortage']:,.1f}개")
+            if risk["first_gap"] is not None:
+                st.warning(f"기준일 이후 최초 재고 부족 예상일: {risk['first_gap']:%Y.%m.%d}. 출고일까지 입고되는 건만 더한 결과입니다.")
+            air_days = master.loc[sid]["항공 리드타임(일)"] if sid in master.index else float("nan")
+            if risk["b2b_shortage"] > 0 and pd.notna(air_days):
+                arrival = DATA_DATE + timedelta(days=int(round(float(air_days))))
+                st.caption(f"발주팀 SKU 마스터의 항공 리드타임 기준 도착 가능일: {arrival:%Y.%m.%d}. 실제 투입 가능 여부·수량은 확인이 필요합니다.")
+            st.caption(f"계산 기준: 2026.10.27 창고 재고, 운송 건별 입고 예정일, 발주안 일평균 출고 {risk['daily_demand']:,.2f}개/일, 입력한 추가 B2B 주문. 일평균 판매량은 날짜별 실제 수요가 아닙니다.")
     if f"planned_{sid}" in st.session_state:
         st.caption(f"담당자 희망량 {st.session_state[f'planned_{sid}']:,}개는 권고량 계산의 입력값이 아니라 비교값입니다.")
     if st.button("발주팀 기준값 복원"):
-        for prefix in ("stock", "transit", "verified_lots", "selected_lots", "planned", "b2b", "b2b_date", "delay", "delayed_qty", "scenario_active"):
+        for prefix in ("stock", "transit", "verified_lots", "selected_lots", "planned", "b2b", "b2b_raw", "b2b_date", "delay", "delayed_qty", "scenario_active"):
             st.session_state.pop(f"{prefix}_{sid}", None)
         st.rerun()
 
