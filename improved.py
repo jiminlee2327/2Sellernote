@@ -6,7 +6,7 @@ CSV 원본의 기준일은 2026-10-27이며 현재 시점의 실시간 재고가
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from html import escape
 from io import BytesIO
 from math import ceil
@@ -28,6 +28,8 @@ div[data-testid="stMetric"] {background:#fff;border:1px solid #d9e5df;border-rad
 .alert-card {padding:.75rem .95rem;border-radius:8px;margin-bottom:.55rem;font-size:.88rem;line-height:1.45}
 .alert-red {background:#fce5e4;border-left:5px solid #d93025;color:#7f1d1d}
 .alert-orange {background:#ffead8;border-left:5px solid #f59e0b;color:#78350f}
+.product-label {font-size:.875rem;margin-bottom:.35rem;color:inherit}
+.product-value {box-sizing:border-box;width:100%;border:1px solid #d3d6dc;border-radius:.5rem;background:#f0f2f6;color:#31333f;font-family:inherit;font-size:1rem;line-height:1.6;padding:.5rem .75rem;margin-bottom:1rem}
 </style>""", unsafe_allow_html=True)
 
 
@@ -72,6 +74,27 @@ def number(value) -> int:
     return int(round(float(value))) if pd.notna(value) else 0
 
 
+def lot_candidates(sid: str) -> pd.DataFrame:
+    """기준일에 이미 입고됐고 만료 전인 과거 로트 후보. 현재 잔량은 미상."""
+    rows = lots[lots["SKU ID"] == sid].copy()
+    rows["입고완료일"] = pd.to_datetime(rows["입고완료일"], errors="coerce")
+    rows["관리일자(소비기한 만료일)"] = pd.to_datetime(rows["관리일자(소비기한 만료일)"], errors="coerce")
+    rows = rows[(rows["입고완료일"] <= pd.Timestamp(DATA_DATE)) &
+                (rows["관리일자(소비기한 만료일)"] > pd.Timestamp(DATA_DATE))].copy()
+    # 원장에 직접 기록된 마감일은 없음. SKU 마스터의 J/소비기한 추정 비율을
+    # 로트의 입고 시 잔여기간에 적용한 참고값으로만 표시한다.
+    reference = master.loc[sid] if sid in master.index else None
+    ratio = (float(reference["판매가능기간 J(일)"]) /
+             float(reference["소비기한 역산(일)"])) if reference is not None and pd.notna(reference["판매가능기간 J(일)"]) and pd.notna(reference["소비기한 역산(일)"]) and float(reference["소비기한 역산(일)"]) > 0 else None
+    rows["추정 판매 마감일"] = (
+        rows["입고완료일"] + pd.to_timedelta(
+            ((rows["관리일자(소비기한 만료일)"] - rows["입고완료일"]).dt.days / .9 * ratio).round(), unit="D"
+        ) if ratio is not None else pd.NaT
+    )
+    rows["로트 키"] = rows["입고ID"].astype(str) + " / " + rows["관리일자(소비기한 만료일)"].dt.strftime("%Y-%m-%d")
+    return rows.drop_duplicates("로트 키").sort_values("관리일자(소비기한 만료일)")
+
+
 def scenario(sid: str) -> dict:
     """발주팀이 제공한 고정 주문선·목표량을 이용한 재고 포지션 민감도.
 
@@ -82,13 +105,15 @@ def scenario(sid: str) -> dict:
     original_transit = number(row["운송 중 재고"])
     stock = st.session_state.get(f"stock_{sid}", original_stock)
     underway = st.session_state.get(f"transit_{sid}", original_transit)
-    position = stock + underway
+    extra_b2b = st.session_state.get(f"b2b_{sid}", 0)
+    delayed_qty = st.session_state.get(f"delayed_qty_{sid}", 0)
+    position = stock + underway - extra_b2b - delayed_qty
     original_position = original_stock + original_transit
     threshold = float(row["주문선 s"])
     target = float(row["목표량 S"])
     pack = number(row["박스 입수"])
     original_qty = number(row["해상 주문량"])
-    if position == original_position:
+    if position == original_position and not st.session_state.get(f"scenario_active_{sid}", False):
         quantity = original_qty
     elif pack <= 0:
         quantity = None
@@ -98,7 +123,8 @@ def scenario(sid: str) -> dict:
         quantity = 0
     return {"stock": stock, "transit": underway, "position": position,
             "quantity": quantity, "original": original_qty,
-            "changed": position != original_position}
+            "changed": position != original_position or st.session_state.get(f"scenario_active_{sid}", False),
+            "extra_b2b": extra_b2b, "delayed_qty": delayed_qty}
 
 
 st.title("발주 검토 대시보드")
@@ -114,18 +140,22 @@ if not matches:
 sid = query if query in plan.index else matches[0]
 row = plan.loc[sid]
 name = str(row["상품명"]) if pd.notna(row["상품명"]) else "상품명 미제공"
-st.text_input("선택한 상품", value=f"{name} ({sid})", disabled=True)
+st.markdown(
+    f'<div class="product-label">선택한 상품</div>'
+    f'<input class="product-value" type="text" value="{escape(name)} ({escape(sid)})" readonly aria-label="선택한 상품">',
+    unsafe_allow_html=True,
+)
 if len(matches) > 1 and query != sid:
     st.caption(f"검색 결과 {len(matches)}건 중 {sid}를 표시합니다. 전체 ID를 입력하면 해당 상품을 볼 수 있습니다.")
 
 state = scenario(sid)
 left, middle, right = st.columns(3)
-left.metric("현재 재고량 (창고 + 운송 중)", f"{state['position']:,}개")
+left.metric("현재 재고량 (창고 + 운송 중)", f"{state['stock'] + state['transit']:,}개")
 middle.markdown(f'<div class="recommend">권고 해상 발주량<br><b>{state["quantity"]:,}개</b></div>' if state["quantity"] is not None else '<div class="recommend">권고 해상 발주량<br><b>계산 불가</b></div>', unsafe_allow_html=True)
 right.metric("권고 발주시점", f"{DATA_DATE:%Y.%m.%d} (기준일)" if state["quantity"] else "현재 발주 불필요")
 st.caption(f"창고 {state['stock']:,}개 + 운송 중 {state['transit']:,}개 · 발주팀 원안 {state['original']:,}개 · 항공 주문량 {number(row['항공 주문량']):,}개")
 if state["changed"]:
-    st.warning("변경 후 권고량은 발주팀의 주문선 s·목표량 S·박스 입수를 고정한 재고 포지션 검토값입니다. 공급처 묶음 발주와 원 규칙 전체를 다시 계산한 공식 발주안은 아닙니다.")
+    st.warning("변경 후 권고량은 발주팀의 발주 기준·목표 재고·박스 입수를 고정한 시나리오 검토값입니다. 로트별 폐기 상한, 신규 B2B 수요의 분포, 공급처 묶음 발주 등 원 규칙 전체를 다시 계산한 공식 발주안은 아닙니다.")
 
 risky = plan[(plan["창고 재고일수"] < 14) & (plan["하루 판매량 d"] > 0)]
 alerted = plan[(plan["항공 주문량"] > 0) | (plan["창고 재고일수"] < 14)].copy()
@@ -155,23 +185,90 @@ tab_overview, tab_status, tab_week = st.tabs(["종합 대시보드", "SKU별 발
 
 with tab_overview:
     st.subheader("발주 시나리오 검토")
-    st.caption("기준일 재고와 운송 중 수량을 확인하거나 수정한 뒤, 주문선과 목표량을 기준으로 변화량을 검토합니다.")
+    st.caption("기준일 재고와 운송 중 수량을 확인하거나 수정한 뒤, 발주 판단 기준과 발주 후 목표 수준으로 변화량을 검토합니다.")
     c1, c2, c3 = st.columns(3)
     c1.metric("발주팀 판단", str(row["판단"]))
-    c2.metric("주문선 s", f"{float(row['주문선 s']):,.2f}개")
-    c3.metric("목표량 S", f"{float(row['목표량 S']):,.2f}개")
+    c2.metric("발주 판단 재고 기준", f"{float(row['주문선 s']):,.2f}개",
+              help="창고 재고와 운송 중 재고의 합계가 이 수준 이하이면 신규 발주를 검토합니다. 발주팀 CSV의 '주문선 s'입니다.")
+    c3.metric("발주 후 목표 재고 수준", f"{float(row['목표량 S']):,.2f}개",
+              help="신규 발주로 채우려는 재고 포지션의 목표입니다. 발주팀 CSV의 '목표량 S'입니다.")
+    candidates = lot_candidates(sid)
+    saved_lots = st.session_state.get(f"verified_lots_{sid}", [])
+    selected_keys = st.multiselect(
+        "현재 창고에 남아 있는 입고 로트 선택",
+        options=candidates["로트 키"].tolist(),
+        default=[x["로트 키"] for x in saved_lots if x["로트 키"] in set(candidates["로트 키"])],
+        key=f"selected_lots_{sid}",
+        help="입고 ID가 같아도 소비기한이 다르면 별도 행입니다. 과거 입고 기록에 있다고 현재 잔량이 있는 것은 아닙니다.",
+    )
     with st.form(f"scenario_{sid}"):
+        st.markdown("#### 1단계 · 현재 보유 재고(로트) 및 예정 입고 확인")
+        st.caption("소비기한은 입고 원장 값입니다. 판매 마감일은 SKU 마스터의 판매가능기간 J/소비기한 비율로 계산한 추정값이므로 확인·수정하세요. 로트 가용 수량은 입력 전에는 알 수 없습니다.")
+        lot_inputs = []
+        for key in selected_keys:
+            item = candidates[candidates["로트 키"] == key].iloc[0]
+            previous = next((x for x in saved_lots if x["로트 키"] == key), {})
+            expiry = item["관리일자(소비기한 만료일)"].date()
+            estimate = item["추정 판매 마감일"]
+            deadline_default = previous.get("판매 마감일", estimate.date() if pd.notna(estimate) else expiry)
+            c_lot, c_qty, c_exp, c_dead = st.columns([1.4, 1, 1.1, 1.1])
+            c_lot.markdown(f"**입고 로트 {escape(key)}**<br>입고일 {item['입고완료일']:%Y.%m.%d}", unsafe_allow_html=True)
+            qty = c_qty.number_input("현재 가용 수량 (개)", min_value=0, value=int(previous.get("수량", 0)), key=f"lot_qty_{sid}_{key}")
+            c_exp.markdown(f"**소비기한 만료일**<br>{expiry:%Y.%m.%d}", unsafe_allow_html=True)
+            deadline = c_dead.date_input("판매 마감일 (추정·수정)", value=deadline_default, key=f"lot_dead_{sid}_{key}")
+            lot_inputs.append({"로트 키": key, "수량": qty, "소비기한": expiry, "판매 마감일": deadline})
+        if not selected_keys:
+            st.info("현재 보유 로트를 확인하지 않았다면 아래 창고 가용재고 합계를 사용합니다. 이때 로트별 판매·폐기량은 계산하지 않습니다.")
         a, b = st.columns(2)
-        stock_input = a.number_input("창고 가용재고 (개)", min_value=0, value=int(state["stock"]), step=1)
+        stock_input = a.number_input("창고 가용재고 합계 (개) · 로트 미선택 시", min_value=0, value=int(state["stock"]), step=1)
         transit_input = b.number_input("운송 중 재고 (개)", min_value=0, value=int(state["transit"]), step=1)
-        submitted = st.form_submit_button("변경값으로 권고량 검토", type="primary")
+        details = transit[transit["SKU ID"] == sid].sort_values("기준일부터 입항 예정까지(일)")
+        if not details.empty:
+            st.caption("발주팀 운송 중 내역: " + " · ".join(f"{number(x['운송 중 수량(개)']):,}개 / D+{number(x['기준일부터 입항 예정까지(일)'])} ({x['근거']})" for _, x in details.iterrows()))
+        st.markdown("#### 2단계 · 신규 발주 희망량 및 돌발 변수 입력")
+        s1, s2, s3, s4 = st.columns(4)
+        planned = s1.number_input("금주 신규 발주 희망 수량 (개)", min_value=0, value=int(st.session_state.get(f"planned_{sid}", state["original"])))
+        extra_b2b = s2.number_input("추가 확정 B2B 주문량 (개)", min_value=0, value=int(state["extra_b2b"]), help="기준일 수요예측에 포함되지 않은 추가 주문만 입력하세요.")
+        b2b_date = s3.date_input("추가 B2B 출고 예정일", value=st.session_state.get(f"b2b_date_{sid}", DATA_DATE))
+        delay = s4.number_input("가장 빠른 예정 입고 지연 (+일)", min_value=0, value=int(st.session_state.get(f"delay_{sid}", 0)), disabled=details.empty)
+        submitted = st.form_submit_button("입력값 반영 및 발주 권고 재계산", type="primary", width="stretch")
     if submitted:
-        st.session_state[f"stock_{sid}"] = int(stock_input)
-        st.session_state[f"transit_{sid}"] = int(transit_input)
-        st.rerun()
+        if any(x["판매 마감일"] > x["소비기한"] for x in lot_inputs):
+            st.error("판매 마감일은 소비기한 만료일보다 늦을 수 없습니다.")
+        elif extra_b2b > 0 and b2b_date < DATA_DATE:
+            st.error("추가 B2B 출고 예정일은 데이터 기준일 이후로 입력해 주세요.")
+        else:
+            st.session_state[f"verified_lots_{sid}"] = lot_inputs
+            st.session_state[f"stock_{sid}"] = sum(x["수량"] for x in lot_inputs) if selected_keys else int(stock_input)
+            st.session_state[f"transit_{sid}"] = int(transit_input)
+            st.session_state[f"planned_{sid}"] = int(planned)
+            lead = number(row["리드타임 L(일)"]) + 14
+            st.session_state[f"b2b_{sid}"] = int(extra_b2b) if (b2b_date - DATA_DATE).days < lead else 0
+            st.session_state[f"b2b_date_{sid}"] = b2b_date
+            st.session_state[f"delay_{sid}"] = int(delay)
+            if not details.empty and int(delay) > 0:
+                earliest = details.iloc[0]
+                eta = number(earliest["기준일부터 입항 예정까지(일)"])
+                excluded = number(earliest["운송 중 수량(개)"]) if eta <= lead < eta + int(delay) else 0
+                st.session_state[f"delayed_qty_{sid}"] = min(int(transit_input), excluded)
+            else:
+                st.session_state[f"delayed_qty_{sid}"] = 0
+            st.session_state[f"scenario_active_{sid}"] = (
+                st.session_state[f"stock_{sid}"] != number(row["창고 재고"])
+                or int(transit_input) != number(row["운송 중 재고"])
+                or st.session_state[f"b2b_{sid}"] > 0
+                or st.session_state[f"delayed_qty_{sid}"] > 0
+            )
+            st.rerun()
+    if saved_lots:
+        st.caption(f"확인된 로트 {len(saved_lots)}건 · 수량 합계 {state['stock']:,}개를 반영했습니다. 로트별 판매 마감일은 발주량의 폐기 상한 계산에 아직 연결되지 않았습니다.")
+    if state["extra_b2b"] or state["delayed_qty"]:
+        st.info(f"추가 B2B 수요 {state['extra_b2b']:,}개 · 보호기간 밖으로 밀린 운송 중 수량 {state['delayed_qty']:,}개를 발주 판단 재고에서 차감했습니다. 출고일별 수요 분포와 입고별 소비기한은 이 간이 계산에 반영되지 않습니다.")
+    if f"planned_{sid}" in st.session_state:
+        st.caption(f"담당자 희망량 {st.session_state[f'planned_{sid}']:,}개는 권고량 계산의 입력값이 아니라 비교값입니다.")
     if st.button("발주팀 기준값 복원"):
-        st.session_state.pop(f"stock_{sid}", None)
-        st.session_state.pop(f"transit_{sid}", None)
+        for prefix in ("stock", "transit", "verified_lots", "selected_lots", "planned", "b2b", "b2b_date", "delay", "delayed_qty", "scenario_active"):
+            st.session_state.pop(f"{prefix}_{sid}", None)
         st.rerun()
 
     if st.session_state.get("show_alert_orders"):
